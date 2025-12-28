@@ -10,9 +10,7 @@ pub fn default_state() -> Arc<EguiState> {
 
 struct EditorData {
     dragging_band: Option<usize>,
-    hovered_band: Option<usize>,
-    // Store the band we started dragging to keep it during the drag
-    drag_start_band: Option<usize>,
+    was_dragging: bool,
 }
 
 // Band colors similar to Pro-Q (distinct colors for each band)
@@ -31,8 +29,7 @@ pub fn create(
 ) -> Option<Box<dyn Editor>> {
     let editor_data = Arc::new(Mutex::new(EditorData {
         dragging_band: None,
-        hovered_band: None,
-        drag_start_band: None,
+        was_dragging: false,
     }));
 
     create_egui_editor(
@@ -43,16 +40,26 @@ pub fn create(
             let mut data = state.lock().unwrap();
             let sample_rate = 44100.0;
 
-            // Dark background like Pro-Q
             egui_ctx.set_visuals(egui::Visuals::dark());
 
-            egui::CentralPanel::default().show(egui_ctx, |ui| {
-                // Get input state BEFORE the plot consumes it
-                let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
-                let modifiers = ui.input(|i| i.modifiers);
-                let _primary_down = ui.input(|i| i.pointer.primary_down());
+            // Get global input state
+            let primary_down = egui_ctx.input(|i| i.pointer.primary_down());
+            let primary_pressed = egui_ctx.input(|i| i.pointer.primary_pressed());
+            let primary_released = egui_ctx.input(|i| i.pointer.primary_released());
+            let scroll_delta = egui_ctx.input(|i| i.raw_scroll_delta.y);
+            let modifiers = egui_ctx.input(|i| i.modifiers);
+            let double_clicked = egui_ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
 
-                // 1. MAIN PLOT AREA (full height, no bottom panel needed)
+            egui::CentralPanel::default().show(egui_ctx, |ui| {
+                let bands = [
+                    &params.band1, &params.band2, &params.band3,
+                    &params.band4, &params.band5, &params.band6
+                ];
+
+                // Store hovered band for use after plot
+                let mut current_hovered: Option<usize> = None;
+                let mut current_pointer_pos: Option<[f64; 2]> = None;
+
                 Plot::new("my_eq_plot")
                     .view_aspect(2.0)
                     .x_axis_label("Frequency (Hz)")
@@ -62,30 +69,21 @@ pub fn create(
                     .include_y(18.0)
                     .include_x(20.0)
                     .include_x(20000.0)
-                    // DISABLE zoom and pan for Pro-Q style direct control
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
                     .allow_boxed_zoom(false)
                     .show(ui, |plot_ui| {
-                        let bands = [
-                            &params.band1, &params.band2, &params.band3,
-                            &params.band4, &params.band5, &params.band6
-                        ];
-
-                        // --- A. Draw individual band response curves (Q visualization) ---
+                        // --- A. Draw individual band curves for hovered/dragged ---
                         for (idx, band) in bands.iter().enumerate() {
                             if !band.active.value() { continue; }
 
-                            let is_hovered = data.hovered_band == Some(idx);
                             let is_dragging = data.dragging_band == Some(idx);
 
-                            // Draw individual band curve when hovered or dragging
-                            if is_hovered || is_dragging {
+                            if is_dragging {
                                 let band_curve: PlotPoints = (0..300).map(|i| {
                                     let x = i as f32;
                                     let f = 20.0 * (1000.0f32).powf(x / 300.0);
-
                                     use crate::biquad::{Biquad, FilterType};
                                     let ft = match band.filter_type.value() {
                                         0 => FilterType::LowShelf,
@@ -102,12 +100,11 @@ pub fn create(
                                     [f as f64, db as f64]
                                 }).collect();
 
-                                let alpha = if is_dragging { 100 } else { 60 };
                                 let color = egui::Color32::from_rgba_unmultiplied(
                                     BAND_COLORS[idx].r(),
                                     BAND_COLORS[idx].g(),
                                     BAND_COLORS[idx].b(),
-                                    alpha
+                                    100
                                 );
                                 plot_ui.line(Line::new(band_curve).width(2.0).color(color).fill(0.0));
                             }
@@ -117,12 +114,12 @@ pub fn create(
                         let curve: PlotPoints = (0..600).map(|i| {
                             let x = i as f32;
                             let f = 20.0 * (1000.0f32).powf(x / 600.0);
-
                             let mut mag = 1.0;
-                            let calc_band = |active: bool, type_idx: i32, freq: f32, q: f32, gain: f32| -> f32 {
-                                if !active { return 1.0; }
+
+                            for band in bands {
+                                if !band.active.value() { continue; }
                                 use crate::biquad::{Biquad, FilterType};
-                                let ft = match type_idx {
+                                let ft = match band.filter_type.value() {
                                     0 => FilterType::LowShelf,
                                     1 => FilterType::HighShelf,
                                     2 => FilterType::Peaking,
@@ -131,18 +128,8 @@ pub fn create(
                                     _ => FilterType::Peaking,
                                 };
                                 let mut b = Biquad::new();
-                                b.update(ft, sample_rate, freq, q, gain);
-                                b.magnitude(f, sample_rate)
-                            };
-
-                            for band in bands {
-                                mag *= calc_band(
-                                    band.active.value(),
-                                    band.filter_type.value(),
-                                    band.freq.value(),
-                                    band.q.value(),
-                                    band.gain.value()
-                                );
+                                b.update(ft, sample_rate, band.freq.value(), band.q.value(), band.gain.value());
+                                mag *= b.magnitude(f, sample_rate);
                             }
 
                             let db = 20.0 * mag.log10();
@@ -152,10 +139,8 @@ pub fn create(
                         plot_ui.line(Line::new(curve).width(2.5).color(egui::Color32::WHITE));
 
                         // --- C. Hit Testing ---
-                        let pointer_pos = plot_ui.pointer_coordinate();
-                        let mut new_hovered_band: Option<usize> = None;
-
-                        if let Some(pos) = pointer_pos {
+                        if let Some(pos) = plot_ui.pointer_coordinate() {
+                            current_pointer_pos = Some([pos.x, pos.y]);
                             let mut min_dist_sq = f64::MAX;
 
                             for (idx, band) in bands.iter().enumerate() {
@@ -164,129 +149,48 @@ pub fn create(
                                 let freq = band.freq.value() as f64;
                                 let gain = band.gain.value() as f64;
 
-                                // Distance in normalized log-frequency and gain space
-                                let dx = (freq.log10() - pos.x.max(1.0).log10()) / 0.4;
-                                let dy = (gain - pos.y) / 6.0;
-
+                                let dx = (freq.log10() - pos.x.max(1.0).log10()) / 0.3;
+                                let dy = (gain - pos.y) / 5.0;
                                 let dist_sq = dx * dx + dy * dy;
 
-                                // Large threshold for easy grabbing
-                                if dist_sq < 0.2 {
-                                    if dist_sq < min_dist_sq {
-                                        min_dist_sq = dist_sq;
-                                        new_hovered_band = Some(idx);
-                                    }
+                                if dist_sq < 0.25 && dist_sq < min_dist_sq {
+                                    min_dist_sq = dist_sq;
+                                    current_hovered = Some(idx);
                                 }
                             }
                         }
 
-                        // Keep tracking the band we're dragging even if pointer moves away
-                        if data.dragging_band.is_none() {
-                            data.hovered_band = new_hovered_band;
-                        }
-
-                        // --- D. Handle Input (Pro-Q 3 Style) ---
-
-                        // DOUBLE CLICK: Create or Delete
-                        if plot_ui.response().double_clicked() {
-                            if let Some(idx) = new_hovered_band {
-                                // Double-click on band -> DELETE
-                                setter.begin_set_parameter(&bands[idx].active);
-                                setter.set_parameter(&bands[idx].active, false);
-                                setter.end_set_parameter(&bands[idx].active);
-                                data.dragging_band = None;
-                                data.hovered_band = None;
-                            } else if let Some(pos) = pointer_pos {
-                                // Double-click on empty -> CREATE new band
-                                if let Some((idx, band)) = bands.iter().enumerate().find(|(_, b)| !b.active.value()) {
-                                    setter.begin_set_parameter(&band.active);
-                                    setter.set_parameter(&band.active, true);
-                                    setter.end_set_parameter(&band.active);
-
-                                    setter.begin_set_parameter(&band.filter_type);
-                                    setter.set_parameter(&band.filter_type, 2); // Peaking
-                                    setter.end_set_parameter(&band.filter_type);
-
-                                    let freq = (pos.x as f32).clamp(20.0, 20000.0);
-                                    setter.begin_set_parameter(&band.freq);
-                                    setter.set_parameter(&band.freq, freq);
-                                    setter.end_set_parameter(&band.freq);
-
-                                    let gain = (pos.y as f32).clamp(-24.0, 24.0);
-                                    setter.begin_set_parameter(&band.gain);
-                                    setter.set_parameter(&band.gain, gain);
-                                    setter.end_set_parameter(&band.gain);
-
-                                    setter.begin_set_parameter(&band.q);
-                                    setter.set_parameter(&band.q, 1.0);
-                                    setter.end_set_parameter(&band.q);
-                                }
-                            }
-                        }
-
-                        // DRAG: Immediate grab and move (no click to select first!)
-                        if plot_ui.response().drag_started() {
-                            if let Some(idx) = new_hovered_band {
-                                data.dragging_band = Some(idx);
-                                data.drag_start_band = Some(idx);
-                                setter.begin_set_parameter(&bands[idx].freq);
-                                setter.begin_set_parameter(&bands[idx].gain);
-                            }
-                        }
-
-                        // While dragging, update position continuously
-                        if let Some(idx) = data.dragging_band {
-                            if let Some(pos) = pointer_pos {
-                                let freq = (pos.x as f32).clamp(20.0, 20000.0);
-                                let gain = (pos.y as f32).clamp(-24.0, 24.0);
-
-                                setter.set_parameter(&bands[idx].freq, freq);
-                                setter.set_parameter(&bands[idx].gain, gain);
-                            }
-                        }
-
-                        if plot_ui.response().drag_stopped() {
-                            if let Some(idx) = data.dragging_band {
-                                setter.end_set_parameter(&bands[idx].freq);
-                                setter.end_set_parameter(&bands[idx].gain);
-                            }
-                            data.dragging_band = None;
-                            data.drag_start_band = None;
-                        }
-
-                        // --- E. Draw Handles ---
+                        // --- D. Draw Handles (ALWAYS for active bands) ---
                         for (idx, band) in bands.iter().enumerate() {
                             if !band.active.value() { continue; }
 
                             let freq = band.freq.value();
                             let gain = band.gain.value();
-
-                            let is_hovered = data.hovered_band == Some(idx) || new_hovered_band == Some(idx);
+                            let is_hovered = current_hovered == Some(idx);
                             let is_dragging = data.dragging_band == Some(idx);
 
-                            // Determine appearance based on state
                             let base_color = BAND_COLORS[idx];
                             let (color, radius) = if is_dragging {
                                 (egui::Color32::WHITE, 14.0)
                             } else if is_hovered {
-                                (base_color, 11.0)
+                                (base_color, 12.0)
                             } else {
-                                (base_color, 8.0)
+                                (base_color, 9.0)
                             };
 
-                            // Draw glow ring for hovered/dragging
+                            // Glow ring
                             if is_hovered || is_dragging {
-                                let glow_alpha = if is_dragging { 150 } else { 80 };
-                                let ring = Points::new(vec![[freq as f64, gain as f64]])
+                                let glow = Points::new(vec![[freq as f64, gain as f64]])
                                     .shape(MarkerShape::Circle)
-                                    .radius(radius + 4.0)
+                                    .radius(radius + 5.0)
                                     .color(egui::Color32::from_rgba_unmultiplied(
-                                        base_color.r(), base_color.g(), base_color.b(), glow_alpha
+                                        base_color.r(), base_color.g(), base_color.b(),
+                                        if is_dragging { 180 } else { 100 }
                                     ));
-                                plot_ui.points(ring);
+                                plot_ui.points(glow);
                             }
 
-                            // Draw main handle
+                            // Main dot
                             let point = Points::new(vec![[freq as f64, gain as f64]])
                                 .shape(MarkerShape::Circle)
                                 .radius(radius)
@@ -296,26 +200,87 @@ pub fn create(
                         }
                     });
 
-                // --- SCROLL WHEEL FOR Q ADJUSTMENT ---
+                // --- Handle mouse interactions OUTSIDE the plot closure ---
+
+                // DOUBLE CLICK: Create or Delete
+                if double_clicked {
+                    if let Some(idx) = current_hovered {
+                        // Delete band
+                        setter.begin_set_parameter(&bands[idx].active);
+                        setter.set_parameter(&bands[idx].active, false);
+                        setter.end_set_parameter(&bands[idx].active);
+                        data.dragging_band = None;
+                    } else if let Some(pos) = current_pointer_pos {
+                        // Create new band
+                        if let Some((idx, band)) = bands.iter().enumerate().find(|(_, b)| !b.active.value()) {
+                            setter.begin_set_parameter(&band.active);
+                            setter.set_parameter(&band.active, true);
+                            setter.end_set_parameter(&band.active);
+
+                            setter.begin_set_parameter(&band.filter_type);
+                            setter.set_parameter(&band.filter_type, 2);
+                            setter.end_set_parameter(&band.filter_type);
+
+                            setter.begin_set_parameter(&band.freq);
+                            setter.set_parameter(&band.freq, (pos[0] as f32).clamp(20.0, 20000.0));
+                            setter.end_set_parameter(&band.freq);
+
+                            setter.begin_set_parameter(&band.gain);
+                            setter.set_parameter(&band.gain, (pos[1] as f32).clamp(-24.0, 24.0));
+                            setter.end_set_parameter(&band.gain);
+
+                            setter.begin_set_parameter(&band.q);
+                            setter.set_parameter(&band.q, 1.0);
+                            setter.end_set_parameter(&band.q);
+
+                            data.dragging_band = Some(idx);
+                        }
+                    }
+                }
+
+                // START DRAG: Mouse pressed on a band
+                if primary_pressed && !double_clicked {
+                    if let Some(idx) = current_hovered {
+                        data.dragging_band = Some(idx);
+                        data.was_dragging = false;
+                        setter.begin_set_parameter(&bands[idx].freq);
+                        setter.begin_set_parameter(&bands[idx].gain);
+                    }
+                }
+
+                // DURING DRAG: Update position
+                if primary_down {
+                    if let Some(idx) = data.dragging_band {
+                        if let Some(pos) = current_pointer_pos {
+                            data.was_dragging = true;
+                            setter.set_parameter(&bands[idx].freq, (pos[0] as f32).clamp(20.0, 20000.0));
+                            setter.set_parameter(&bands[idx].gain, (pos[1] as f32).clamp(-24.0, 24.0));
+                        }
+                    }
+                }
+
+                // END DRAG: Mouse released
+                if primary_released {
+                    if let Some(idx) = data.dragging_band {
+                        setter.end_set_parameter(&bands[idx].freq);
+                        setter.end_set_parameter(&bands[idx].gain);
+                    }
+                    data.dragging_band = None;
+                }
+
+                // SCROLL: Adjust Q
                 if scroll_delta.abs() > 0.0 {
-                    let target_band = data.dragging_band.or(data.hovered_band);
-                    if let Some(idx) = target_band {
-                        let bands = [
-                            &params.band1, &params.band2, &params.band3,
-                            &params.band4, &params.band5, &params.band6
-                        ];
+                    let target = data.dragging_band.or(current_hovered);
+                    if let Some(idx) = target {
                         let band = bands[idx];
-
                         if band.active.value() {
-                            let current_q = band.q.value();
-                            let q_factor = if modifiers.shift { 1.02 } else { 1.1 };
-
+                            let q = band.q.value();
+                            let factor = if modifiers.shift { 1.02 } else { 1.1 };
                             let new_q = if scroll_delta > 0.0 {
-                                (current_q * q_factor).min(10.0)
+                                (q * factor).min(10.0)
                             } else {
-                                (current_q / q_factor).max(0.1)
+                                (q / factor).max(0.1)
                             };
-
                             setter.begin_set_parameter(&band.q);
                             setter.set_parameter(&band.q, new_q);
                             setter.end_set_parameter(&band.q);
@@ -323,29 +288,21 @@ pub fn create(
                     }
                 }
 
-                // 2. MINIMAL INFO BAR (only shows when interacting)
-                let active_band = data.dragging_band.or(data.hovered_band);
-                if let Some(idx) = active_band {
-                    let bands = [
-                        &params.band1, &params.band2, &params.band3,
-                        &params.band4, &params.band5, &params.band6
-                    ];
+                // INFO BAR (only when dragging)
+                if let Some(idx) = data.dragging_band {
                     let band = bands[idx];
-
                     if band.active.value() {
                         egui::TopBottomPanel::bottom("info")
-                            .frame(egui::Frame::none().fill(egui::Color32::from_rgba_unmultiplied(30, 30, 30, 220)))
+                            .frame(egui::Frame::none().fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 240)))
                             .show_inside(ui, |ui| {
-                                ui.add_space(6.0);
+                                ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(10.0);
+                                    ui.add_space(15.0);
 
-                                    // Color indicator
                                     let color = BAND_COLORS[idx];
-                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                                    ui.painter().circle_filled(rect.center(), 6.0, color);
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 7.0, color);
 
-                                    // Filter type selector
                                     egui::ComboBox::from_id_salt("type")
                                         .width(90.0)
                                         .selected_text(match band.filter_type.value() {
@@ -357,10 +314,7 @@ pub fn create(
                                             _ => "Bell",
                                         })
                                         .show_ui(ui, |ui| {
-                                            for (val, name) in [
-                                                (0, "Low Shelf"), (1, "High Shelf"), (2, "Bell"),
-                                                (3, "Low Pass"), (4, "High Pass")
-                                            ] {
+                                            for (val, name) in [(0, "Low Shelf"), (1, "High Shelf"), (2, "Bell"), (3, "Low Pass"), (4, "High Pass")] {
                                                 if ui.selectable_label(band.filter_type.value() == val, name).clicked() {
                                                     setter.begin_set_parameter(&band.filter_type);
                                                     setter.set_parameter(&band.filter_type, val);
@@ -370,20 +324,14 @@ pub fn create(
                                         });
 
                                     ui.separator();
-
-                                    // Frequency display/slider
                                     ui.label("Freq:");
                                     ui.add(widgets::ParamSlider::for_param(&band.freq, setter).with_width(100.0));
-
-                                    // Gain display/slider
                                     ui.label("Gain:");
                                     ui.add(widgets::ParamSlider::for_param(&band.gain, setter).with_width(80.0));
-
-                                    // Q display/slider
                                     ui.label("Q:");
                                     ui.add(widgets::ParamSlider::for_param(&band.q, setter).with_width(70.0));
                                 });
-                                ui.add_space(4.0);
+                                ui.add_space(6.0);
                             });
                     }
                 }
