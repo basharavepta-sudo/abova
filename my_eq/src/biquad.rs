@@ -1,16 +1,18 @@
 use std::f32::consts::PI;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilterType {
     LowShelf,
     HighShelf,
     Peaking,
+    LowPass,
+    HighPass,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Biquad {
     // Coefficients
-    a0: f32, // Not strictly needed if normalized, but kept for clarity/structure
+    a0: f32, // Normalized to 1.0 usually
     a1: f32,
     a2: f32,
     b0: f32,
@@ -71,6 +73,24 @@ impl Biquad {
                 a1 = -2.0 * cos_w0;
                 a2 = 1.0 - alpha / a;
             }
+            FilterType::LowPass => {
+                // LP: H(s) = 1 / (s^2 + s/Q + 1)
+                b0 = (1.0 - cos_w0) / 2.0;
+                b1 = 1.0 - cos_w0;
+                b2 = (1.0 - cos_w0) / 2.0;
+                a0 = 1.0 + alpha;
+                a1 = -2.0 * cos_w0;
+                a2 = 1.0 - alpha;
+            }
+            FilterType::HighPass => {
+                // HP: H(s) = s^2 / (s^2 + s/Q + 1)
+                b0 = (1.0 + cos_w0) / 2.0;
+                b1 = -(1.0 + cos_w0);
+                b2 = (1.0 + cos_w0) / 2.0;
+                a0 = 1.0 + alpha;
+                a1 = -2.0 * cos_w0;
+                a2 = 1.0 - alpha;
+            }
         }
 
         // Normalize
@@ -91,9 +111,35 @@ impl Biquad {
 
         let out = self.b0 * sample + self.s1;
 
+        // Denormal protection can be added here if needed, but for now simple
         self.s1 = self.s2 + self.b1 * sample - self.a1 * out;
         self.s2 = self.b2 * sample - self.a2 * out;
 
         out
+    }
+
+    /// Calculate magnitude response at a given frequency
+    pub fn magnitude(&self, freq: f32, sample_rate: f32) -> f32 {
+        let w = 2.0 * PI * freq / sample_rate;
+        let cos_w = w.cos();
+        let sin_w = w.sin();
+
+        // H(z) = (b0 + b1 z^-1 + b2 z^-2) / (1 + a1 z^-1 + a2 z^-2)
+        // z^-1 = cos(w) - j sin(w)
+        // z^-2 = cos(2w) - j sin(2w)
+
+        let cos_2w = (2.0 * w).cos();
+        let sin_2w = (2.0 * w).sin();
+
+        let num_re = self.b0 + self.b1 * cos_w + self.b2 * cos_2w;
+        let num_im = -self.b1 * sin_w - self.b2 * sin_2w;
+
+        let den_re = 1.0 + self.a1 * cos_w + self.a2 * cos_2w;
+        let den_im = -self.a1 * sin_w - self.a2 * sin_2w;
+
+        let num_mag_sq = num_re * num_re + num_im * num_im;
+        let den_mag_sq = den_re * den_re + den_im * den_im;
+
+        (num_mag_sq / den_mag_sq).sqrt()
     }
 }

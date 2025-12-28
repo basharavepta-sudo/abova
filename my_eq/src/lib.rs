@@ -1,48 +1,63 @@
 use nih_plug::prelude::*;
+use nih_plug_egui::{EguiState, create_egui_editor}; // Check imports
 use std::sync::Arc;
 
 pub mod biquad;
 pub use biquad::{Biquad, FilterType};
 
+mod editor;
+
 struct MyEq {
     params: Arc<MyEqParams>,
 
-    // Per-channel filters
-    low_shelf: Vec<Biquad>,
-    mid_peak: Vec<Biquad>,
-    high_shelf: Vec<Biquad>,
+    // Per-channel filters. Outer Vec = Channels, Inner Vec = Bands
+    filters: Vec<Vec<Biquad>>,
 }
 
 #[derive(Params)]
-struct MyEqParams {
-    // Low Shelf
-    #[id = "low_gain"]
-    pub low_gain: FloatParam,
-    #[id = "low_freq"]
-    pub low_freq: FloatParam,
+pub struct MyEqParams {
+    /// The editor state, saved together with the parameter state so the custom
+    /// scaling can be restored.
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 
-    // Mid Peak
-    #[id = "mid_gain"]
-    pub mid_gain: FloatParam,
-    #[id = "mid_freq"]
-    pub mid_freq: FloatParam,
-    #[id = "mid_q"]
-    pub mid_q: FloatParam,
+    #[nested(group = "Band 1")]
+    pub band1: BandParams,
+    #[nested(group = "Band 2")]
+    pub band2: BandParams,
+    #[nested(group = "Band 3")]
+    pub band3: BandParams,
+    #[nested(group = "Band 4")]
+    pub band4: BandParams,
+    #[nested(group = "Band 5")]
+    pub band5: BandParams,
+    #[nested(group = "Band 6")]
+    pub band6: BandParams,
+}
 
-    // High Shelf
-    #[id = "high_gain"]
-    pub high_gain: FloatParam,
-    #[id = "high_freq"]
-    pub high_freq: FloatParam,
+#[derive(Params)]
+pub struct BandParams {
+    #[id = "active"]
+    pub active: BoolParam,
+
+    #[id = "type"]
+    pub filter_type: IntParam, // 0: LowShelf, 1: HighShelf, 2: Peaking, 3: LowPass, 4: HighPass
+
+    #[id = "freq"]
+    pub freq: FloatParam,
+
+    #[id = "gain"]
+    pub gain: FloatParam,
+
+    #[id = "q"]
+    pub q: FloatParam,
 }
 
 impl Default for MyEq {
     fn default() -> Self {
         Self {
             params: Arc::new(MyEqParams::default()),
-            low_shelf: Vec::new(),
-            mid_peak: Vec::new(),
-            high_shelf: Vec::new(),
+            filters: Vec::new(),
         }
     }
 }
@@ -50,53 +65,46 @@ impl Default for MyEq {
 impl Default for MyEqParams {
     fn default() -> Self {
         Self {
-            low_gain: FloatParam::new(
-                "Low Gain",
-                0.0,
-                FloatRange::Linear { min: -18.0, max: 18.0 },
-            )
-            .with_unit(" dB"),
+            editor_state: editor::default_state(),
+            band1: BandParams::new(true, 0, 100.0, 0.0, 0.707),
+            band2: BandParams::new(true, 2, 200.0, 0.0, 0.707),
+            band3: BandParams::new(true, 2, 500.0, 0.0, 0.707),
+            band4: BandParams::new(true, 2, 1000.0, 0.0, 0.707),
+            band5: BandParams::new(true, 2, 5000.0, 0.0, 0.707),
+            band6: BandParams::new(true, 1, 10000.0, 0.0, 0.707),
+        }
+    }
+}
 
-            low_freq: FloatParam::new(
-                "Low Freq",
-                100.0,
-                FloatRange::Skewed { min: 20.0, max: 2000.0, factor: FloatRange::skew_factor(-1.0) },
-            )
-            .with_unit(" Hz"),
-
-            mid_gain: FloatParam::new(
-                "Mid Gain",
-                0.0,
-                FloatRange::Linear { min: -18.0, max: 18.0 },
-            )
-            .with_unit(" dB"),
-
-            mid_freq: FloatParam::new(
-                "Mid Freq",
-                1000.0,
-                FloatRange::Skewed { min: 100.0, max: 10000.0, factor: FloatRange::skew_factor(0.0) },
-            )
-            .with_unit(" Hz"),
-
-            mid_q: FloatParam::new(
-                "Mid Q",
-                0.707,
-                FloatRange::Linear { min: 0.1, max: 10.0 },
+impl BandParams {
+    fn new(active: bool, type_val: i32, freq: f32, gain: f32, q: f32) -> Self {
+        Self {
+            active: BoolParam::new("Active", active),
+            filter_type: IntParam::new(
+                "Type",
+                type_val,
+                IntRange::Linear { min: 0, max: 4 },
             ),
+            freq: FloatParam::new(
+                "Frequency",
+                freq,
+                FloatRange::Skewed { min: 20.0, max: 20000.0, factor: FloatRange::skew_factor(1000.0) },
+            )
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1)),
 
-            high_gain: FloatParam::new(
-                "High Gain",
-                0.0,
-                FloatRange::Linear { min: -18.0, max: 18.0 },
+            gain: FloatParam::new(
+                "Gain",
+                gain,
+                FloatRange::Linear { min: -24.0, max: 24.0 },
             )
             .with_unit(" dB"),
 
-            high_freq: FloatParam::new(
-                "High Freq",
-                5000.0,
-                FloatRange::Skewed { min: 2000.0, max: 20000.0, factor: FloatRange::skew_factor(1.0) },
-            )
-            .with_unit(" Hz"),
+            q: FloatParam::new(
+                "Q",
+                q,
+                FloatRange::Skewed { min: 0.1, max: 10.0, factor: FloatRange::skew_factor(1.0) },
+            ),
         }
     }
 }
@@ -135,37 +143,32 @@ impl Plugin for MyEq {
         self.params.clone()
     }
 
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        editor::create(
+            self.params.clone(),
+            self.params.editor_state.clone(),
+        )
+    }
+
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         _buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        // Resize filters to match channel count
-        // buffer_config.input_channels was removed, we use audio_io_layout or assume based on buffer in process
-        // Actually, we can get channel count from _audio_io_layout
-
-        // Wait, AudioIOLayout is a struct describing capability, not the *active* layout necessarily in initialize?
-        // Ah, initialize is called with the *selected* layout.
-
         let num_channels = _audio_io_layout.main_input_channels.map(|n| n.get()).unwrap_or(2) as usize;
 
-        self.low_shelf = vec![Biquad::new(); num_channels];
-        self.mid_peak = vec![Biquad::new(); num_channels];
-        self.high_shelf = vec![Biquad::new(); num_channels];
+        // 6 bands per channel
+        self.filters = vec![vec![Biquad::new(); 6]; num_channels];
 
         true
     }
 
     fn reset(&mut self) {
-        for filter in &mut self.low_shelf {
-            filter.reset();
-        }
-        for filter in &mut self.mid_peak {
-            filter.reset();
-        }
-        for filter in &mut self.high_shelf {
-            filter.reset();
+        for channel_filters in &mut self.filters {
+            for filter in channel_filters {
+                filter.reset();
+            }
         }
     }
 
@@ -178,32 +181,43 @@ impl Plugin for MyEq {
         let sample_rate = context.transport().sample_rate;
 
         for (channel_idx, channel_samples) in buffer.as_slice().iter_mut().enumerate() {
-            // Safety check for channel index
-            if channel_idx >= self.low_shelf.len() {
+            if channel_idx >= self.filters.len() {
                 break;
             }
 
-            let low_filter = &mut self.low_shelf[channel_idx];
-            let mid_filter = &mut self.mid_peak[channel_idx];
-            let high_filter = &mut self.high_shelf[channel_idx];
+            let channel_filters = &mut self.filters[channel_idx];
 
             for sample in channel_samples.iter_mut() {
-                let low_g = self.params.low_gain.value();
-                let low_f = self.params.low_freq.value();
-                let mid_g = self.params.mid_gain.value();
-                let mid_f = self.params.mid_freq.value();
-                let mid_q = self.params.mid_q.value();
-                let high_g = self.params.high_gain.value();
-                let high_f = self.params.high_freq.value();
+                // Collect parameters for 6 bands
+                // This is redundant to do per sample, but required for sample accurate automation.
+                // We will iterate 6 bands.
 
-                low_filter.update(FilterType::LowShelf, sample_rate, low_f, 0.707, low_g);
-                mid_filter.update(FilterType::Peaking, sample_rate, mid_f, mid_q, mid_g);
-                high_filter.update(FilterType::HighShelf, sample_rate, high_f, 0.707, high_g);
+                // Helper closure to process one band
+                let mut process_band = |band_idx: usize, active: bool, type_idx: i32, freq: f32, q: f32, gain: f32, s: f32| -> f32 {
+                    if !active {
+                        return s;
+                    }
+                    let ft = match type_idx {
+                        0 => FilterType::LowShelf,
+                        1 => FilterType::HighShelf,
+                        2 => FilterType::Peaking,
+                        3 => FilterType::LowPass,
+                        4 => FilterType::HighPass,
+                        _ => FilterType::Peaking,
+                    };
 
-                let s = *sample;
-                let s = low_filter.process(s);
-                let s = mid_filter.process(s);
-                let s = high_filter.process(s);
+                    let filter = &mut channel_filters[band_idx];
+                    filter.update(ft, sample_rate, freq, q, gain);
+                    filter.process(s)
+                };
+
+                let mut s = *sample;
+                s = process_band(0, self.params.band1.active.value(), self.params.band1.filter_type.value(), self.params.band1.freq.value(), self.params.band1.q.value(), self.params.band1.gain.value(), s);
+                s = process_band(1, self.params.band2.active.value(), self.params.band2.filter_type.value(), self.params.band2.freq.value(), self.params.band2.q.value(), self.params.band2.gain.value(), s);
+                s = process_band(2, self.params.band3.active.value(), self.params.band3.filter_type.value(), self.params.band3.freq.value(), self.params.band3.q.value(), self.params.band3.gain.value(), s);
+                s = process_band(3, self.params.band4.active.value(), self.params.band4.filter_type.value(), self.params.band4.freq.value(), self.params.band4.q.value(), self.params.band4.gain.value(), s);
+                s = process_band(4, self.params.band5.active.value(), self.params.band5.filter_type.value(), self.params.band5.freq.value(), self.params.band5.q.value(), self.params.band5.gain.value(), s);
+                s = process_band(5, self.params.band6.active.value(), self.params.band6.filter_type.value(), self.params.band6.freq.value(), self.params.band6.q.value(), self.params.band6.gain.value(), s);
 
                 *sample = s;
             }
@@ -215,7 +229,7 @@ impl Plugin for MyEq {
 
 impl ClapPlugin for MyEq {
     const CLAP_ID: &'static str = "com.myvendor.myeq";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("A simple 3-band equalizer");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("A simple 6-band equalizer");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Equalizer];
